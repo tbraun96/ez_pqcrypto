@@ -21,7 +21,7 @@ bytes = "0.5.4"
 pqcrypto = "0.9.0"
 
 [dev-dependencies]
-criterion = "*"
+criterion = "0.3.1"
 
 [profile.bench]
 debug = true
