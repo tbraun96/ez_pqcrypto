@@ -7,7 +7,6 @@ description = "Abstracts over pqcrypto. Allows selecting a post-quantum encrypti
 readme = "README.md"
 homepage = "https://thomaspbraun.com/"
 repository = "https://github.com/tbraun96/ez_pqcrypto/"
-license = "AGPL-3.0-only"
 license-file = "LICENSE"
 workspace = "../"
 
