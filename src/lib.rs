@@ -2,10 +2,18 @@
 
 use bytes::{BytesMut, BufMut};
 use crate::algorithm_dictionary::*;
+use rand::Rng;
+use pqcrypto_traits::Error;
+use crate::export::PostQuantumExport;
+use bincode2::ErrorKind;
+use std::convert::TryFrom;
 
 pub mod prelude {
     pub use crate::{PQNode, PostQuantumContainer, PostQuantumType, algorithm_dictionary};
 }
+
+/// For handling serialization/deserialization
+pub mod export;
 
 /// Contains the public keys for Alice and Bob
 pub struct PostQuantumContainer {
@@ -30,18 +38,23 @@ pub enum PQNode {
 impl PostQuantumContainer {
     /// Creates a new [PostQuantumContainer] for Alice. This will panic if the algorithm is
     /// invalid
-    pub fn new_alice(algorithm: u8) -> Self {
+    ///
+    /// `algorithm`: If this is None, a random algorithm will be used
+    pub fn new_alice(algorithm: Option<u8>) -> Self {
+        let algorithm = algorithm.unwrap_or_else(|| {
+            rand::thread_rng().gen_range(0, ALGORITHM_COUNT)
+        });
         Self { algorithm, data: Self::get_new_alice(algorithm), node: PQNode::Alice }
     }
 
     /// Creates a new [PostQuantumContainer] for Bob. This will panic if the algorithm is
     /// invalid
-    pub fn new_bob(algorithm: u8, public_key: &[u8]) -> Self {
-        Self { algorithm, data: Self::get_new_bob(algorithm, public_key), node: PQNode::Bob }
+    pub fn new_bob(algorithm: u8, public_key: &[u8]) -> Result<Self, Error> {
+        Ok(Self { algorithm, data: Self::get_new_bob(algorithm, public_key)?, node: PQNode::Bob })
     }
 
     /// Internally creates shared key after bob sends a response back to Alice
-    pub fn alice_on_receive_ciphertext(&mut self, ciphertext: &[u8]) {
+    pub fn alice_on_receive_ciphertext(&mut self, ciphertext: &[u8]) -> Result<(), Error> {
         debug_assert!(self.node == PQNode::Alice);
         self.data.alice_on_receive_ciphertext(ciphertext)
     }
@@ -50,16 +63,29 @@ impl PostQuantumContainer {
         self.data.get_public_key()
     }
     /// Gets the secret key (If node is Alice type)
-    pub fn get_secret_key(&self) -> &[u8] {
+    pub fn get_secret_key(&self) -> Result<&[u8], Error> {
         self.data.get_secret_key()
     }
     /// Gets the ciphertext
-    pub fn get_ciphertext(&self) -> &[u8] {
+    pub fn get_ciphertext(&self) -> Result<&[u8], Error> {
         self.data.get_ciphertext()
     }
     /// Gets the shared secret
-    pub fn get_shared_secret(&self) -> &[u8] {
+    pub fn get_shared_secret(&self) -> Result<&[u8], Error> {
         self.data.get_shared_secret()
+    }
+
+    /// Serializes the entire package to a vector
+    pub fn serialize_to_vector(&self) -> Result<Vec<u8>, Box<ErrorKind>> {
+        let export = PostQuantumExport::from(self);
+        bincode2::serialize(&export)
+    }
+
+    /// Attempts to deserialize the input bytesm presumed to be of type [PostQuantumExport],
+    /// into a [PostQuantumContainer]
+    pub fn deserialize_from_bytes<B: AsRef<[u8]>>(bytes: B) -> Result<Self, Box<ErrorKind>> {
+        let export = bincode2::deserialize::<PostQuantumExport>(bytes.as_ref())?;
+        PostQuantumContainer::try_from(export)
     }
 
     /// Returns either Alice or Bob
@@ -77,16 +103,40 @@ impl PostQuantumContainer {
         crate::function_pointers::ALICE_FP[algorithm as usize]()
     }
 
-    fn get_new_bob(algorithm: u8, public_key: &[u8]) -> Box<dyn PostQuantumType> {
+    fn get_new_bob(algorithm: u8, public_key: &[u8]) -> Result<Box<dyn PostQuantumType>, Error> {
         assert!(algorithm < ALGORITHM_COUNT);
         crate::function_pointers::BOB_FP[algorithm as usize](public_key)
+    }
+}
+
+impl TryFrom<PostQuantumExport> for PostQuantumContainer {
+    type Error = Box<ErrorKind>;
+
+    fn try_from(export: PostQuantumExport) -> Result<Self, Self::Error> {
+        // First, create the type, pretending this node is Bob since we already
+        // have the public key
+        let mut container = PostQuantumContainer::new_bob(export.algorithm, export.public_key.as_slice())
+            .map_err(|err| Box::new(ErrorKind::Custom(err.to_string())))?;
+        // Now, begin setting the values
+        if let Some(secret_key) = export.secret_key {
+            container.data.set_secret_key(secret_key.as_slice()).map_err(|err| Box::new(ErrorKind::Custom(err.to_string())))?;
+        }
+
+        if let Some(ciphertext) = export.ciphertext {
+            container.data.set_ciphertext(ciphertext.as_slice()).map_err(|err| Box::new(ErrorKind::Custom(err.to_string())))?;
+        }
+
+        if let Some(shared_secret) = export.shared_secret {
+            container.data.set_shared_secret(shared_secret.as_slice()).map_err(|err| Box::new(ErrorKind::Custom(err.to_string())))?;
+        }
+
+        Ok(container)
     }
 }
 
 /// Used for packet transmission
 #[allow(missing_docs)]
 pub mod algorithm_dictionary {
-
     pub const ALGORITHM_COUNT: u8 = 42;
 
     pub const BABYBEAR: u8 = 0;
@@ -149,36 +199,46 @@ pub trait PostQuantumType {
     /// Creates a new self for the initiating node
     fn new_alice() -> Self where Self: Sized;
     /// Creates a new self for the receiving node
-    fn new_bob(public_key: &[u8]) -> Self where Self: Sized;
+    fn new_bob(public_key: &[u8]) -> Result<Self, Error> where Self: Sized;
     /// Internally creates shared key after bob sends a response back to Alice
-    fn alice_on_receive_ciphertext(&mut self, ciphertext: &[u8]);
+    fn alice_on_receive_ciphertext(&mut self, ciphertext: &[u8]) -> Result<(), Error>;
     /// Gets the public key
     fn get_public_key(&self) -> &[u8];
     /// Gets the secret key (If node is Alice type)
-    fn get_secret_key(&self) -> &[u8];
+    fn get_secret_key(&self) -> Result<&[u8], Error>;
     /// Gets the ciphertext
-    fn get_ciphertext(&self) -> &[u8];
+    fn get_ciphertext(&self) -> Result<&[u8], Error>;
     /// Gets the shared secret
-    fn get_shared_secret(&self) -> &[u8];
+    fn get_shared_secret(&self) -> Result<&[u8], Error>;
+    /// Sets the secret key
+    fn set_secret_key(&mut self, secret_key: &[u8]) -> Result<(), Error>;
+    /// Sets the ciphertext
+    fn set_ciphertext(&mut self, ciphertext: &[u8]) -> Result<(), Error>;
+    /// Sets the shared key
+    fn set_shared_secret(&mut self, shared_key: &[u8]) -> Result<(), Error>;
     /// Encrypts the data. Since this is meant for small data, no heavy optimization is used
-    fn encrypt_data<T: AsRef<[u8]>>(&self, input: T, output: &mut BytesMut) where Self: Sized {
+    fn encrypt_data<T: AsRef<[u8]>>(&self, input: T, output: &mut BytesMut) -> Result<(), Error> where Self: Sized {
         let input = input.as_ref();
-        let ss = self.get_shared_secret();
+        let ss = self.get_shared_secret()?;
         let ss_len = ss.len();
 
         for (idx, byte) in input.iter().enumerate() {
             output.put_u8(*byte ^ ss[idx % ss_len])
         }
+
+        Ok(())
     }
     /// Decrypts the data
-    fn decrypt_data<T: AsRef<[u8]>>(&self, input: T, output: &mut BytesMut) where Self: Sized {
+    fn decrypt_data<T: AsRef<[u8]>>(&self, input: T, output: &mut BytesMut) -> Result<(), Error> where Self: Sized {
         let input = input.as_ref();
-        let ss = self.get_shared_secret();
+        let ss = self.get_shared_secret()?;
         let ss_len = ss.len();
 
         for (idx, byte) in input.iter().enumerate() {
             output.put_u8(*byte ^ ss[idx % ss_len])
         }
+
+        Ok(())
     }
 }
 
@@ -205,41 +265,87 @@ macro_rules! create_struct {
                 Self { public_key, secret_key, ciphertext, shared_secret }
             }
 
-            fn new_bob(public_key: &[u8]) -> Self {
-                let public_key = pqcrypto::kem::$name::PublicKey::from_bytes(public_key).unwrap();
+            fn new_bob(public_key: &[u8]) -> Result<Self, Error> {
+                let public_key = pqcrypto::kem::$name::PublicKey::from_bytes(public_key)?;
                 let (shared_secret, ciphertext) = pqcrypto::kem::$name::encapsulate(&public_key);
                 let secret_key = None;
                 let shared_secret = Some(shared_secret);
                 let ciphertext = Some(ciphertext);
-                Self { public_key, secret_key, ciphertext, shared_secret }
+                Ok(Self { public_key, secret_key, ciphertext, shared_secret })
             }
 
-            fn alice_on_receive_ciphertext(&mut self, ciphertext: &[u8]) {
+            fn alice_on_receive_ciphertext(&mut self, ciphertext: &[u8]) -> Result<(), Error> {
                 // These functions should only be called once upon response back from Bob
                 debug_assert!(self.shared_secret.is_none());
                 debug_assert!(self.ciphertext.is_none());
                 debug_assert!(self.secret_key.is_some());
 
-                let ciphertext = pqcrypto::kem::$name::Ciphertext::from_bytes(ciphertext).unwrap();
-                let shared_secret = pqcrypto::kem::$name::decapsulate(&ciphertext, self.secret_key.as_ref().unwrap());
-                self.ciphertext = Some(ciphertext);
-                self.shared_secret = Some(shared_secret);
+                let ciphertext = pqcrypto::kem::$name::Ciphertext::from_bytes(ciphertext)?;
+
+                if let Some(secret_key) = self.secret_key.as_ref() {
+                    let shared_secret = pqcrypto::kem::$name::decapsulate(&ciphertext, secret_key);
+                    self.ciphertext = Some(ciphertext);
+                    self.shared_secret = Some(shared_secret);
+                    Ok(())
+                } else {
+                    Err(Error::BadLength {
+                        name: "Unable to get secret key",
+                        actual: 0,
+                        expected: 0
+                    })
+                }
             }
 
             fn get_public_key(&self) -> &[u8] {
                 self.public_key.as_bytes()
             }
 
-            fn get_secret_key(&self) -> &[u8] {
-                self.secret_key.as_ref().unwrap().as_bytes()
+            fn get_secret_key(&self) -> Result<&[u8], Error> {
+                if let Some(secret_key) = self.secret_key.as_ref() {
+                    Ok(secret_key.as_bytes())
+                } else {
+                    Err(get_generic_error("Unable to get secret key"))
+                }
             }
 
-            fn get_ciphertext(&self) -> &[u8] {
-                self.ciphertext.as_ref().unwrap().as_bytes()
+            fn get_ciphertext(&self) -> Result<&[u8], Error> {
+                if let Some(ciphertext) = self.ciphertext.as_ref() {
+                    Ok(ciphertext.as_bytes())
+                } else {
+                    Err(get_generic_error("Unable to get ciphertext"))
+                }
             }
 
-            fn get_shared_secret(&self) -> &[u8] {
-                self.shared_secret.as_ref().unwrap().as_bytes()
+            fn get_shared_secret(&self) -> Result<&[u8], Error> {
+                if let Some(shared_secret) = self.shared_secret.as_ref() {
+                    Ok(shared_secret.as_bytes())
+                } else {
+                    Err(get_generic_error("Unable to get secret key"))
+                }
+            }
+
+            /// Sets the secret key
+            fn set_secret_key(&mut self, secret_key: &[u8]) -> Result<(), Error> {
+                let secret_key = pqcrypto::kem::$name::SecretKey::from_bytes(secret_key)?;
+                self.secret_key = Some(secret_key);
+
+                Ok(())
+            }
+
+            /// Sets the ciphertext
+            fn set_ciphertext(&mut self, ciphertext: &[u8]) -> Result<(), Error> {
+                let ciphertext = pqcrypto::kem::$name::Ciphertext::from_bytes(ciphertext)?;
+                self.ciphertext = Some(ciphertext);
+
+                Ok(())
+            }
+
+            /// Sets the shared key
+            fn set_shared_secret(&mut self, shared_secret: &[u8]) -> Result<(), Error> {
+                let shared_secret = pqcrypto::kem::$name::SharedSecret::from_bytes(shared_secret)?;
+                self.shared_secret = Some(shared_secret);
+
+                Ok(())
             }
         }
     };
@@ -248,11 +354,12 @@ macro_rules! create_struct {
 pub(crate) mod function_pointers {
     use crate::PostQuantumType;
     use crate::algorithm_dictionary::ALGORITHM_COUNT;
+    use pqcrypto_traits::Error;
 
     macro_rules! box_alice {
     ($constructor:expr) => {{
         #[inline(never)]
-        fn alice_box_fn() -> Box<dyn PostQuantumType> {
+        fn alice_box_fn() -> Box<dyn PostQuantumType>{
             Box::new(($constructor)())
         }
 
@@ -263,8 +370,8 @@ pub(crate) mod function_pointers {
     macro_rules! box_bob {
     ($constructor:expr) => {{
         #[inline(never)]
-        fn bob_box_fn(arr: &[u8]) -> Box<dyn PostQuantumType> {
-            Box::new(($constructor)(arr))
+        fn bob_box_fn(arr: &[u8]) -> Result<Box<dyn PostQuantumType>, Error> {
+            Ok(Box::new(($constructor)(arr)?))
         }
 
         bob_box_fn
@@ -274,32 +381,25 @@ pub(crate) mod function_pointers {
     pub(crate) static ALICE_FP: [fn() -> Box<dyn PostQuantumType>; ALGORITHM_COUNT as usize] = [
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_babybear::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_babybearephem::new_alice),
-
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_firesaber::new_alice),
-
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem640aes::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem640shake::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem976aes::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem976shake::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem1344aes::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem1344shake::new_alice),
-
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_kyber512::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_kyber768::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_kyber1024::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_kyber51290s::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_kyber76890s::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_kyber102490s::new_alice),
-
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_ledakemlt12::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_ledakemlt32::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_ledakemlt52::new_alice),
-
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_lightsaber::new_alice),
-
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_mamabear::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_mamabearephem::new_alice),
-
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_mceliece348864::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_mceliece348864f::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_mceliece460896::new_alice),
@@ -310,52 +410,41 @@ pub(crate) mod function_pointers {
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_mceliece6960119f::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_mceliece8192128::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_mceliece8192128f::new_alice),
-
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_newhope512cca::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_newhope512cpa::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_newhope1024cca::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_newhope1024cpa::new_alice),
-
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_ntruhps2048509::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_ntruhps2048677::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_ntruhps4096821::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_ntruhrss701::new_alice),
-
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_papabear::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_papabearephem::new_alice),
-
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_saber::new_alice)
     ];
 
-    pub(crate) static BOB_FP: [fn(&[u8]) -> Box<dyn PostQuantumType>; ALGORITHM_COUNT as usize] = [
+    pub(crate) static BOB_FP: [fn(&[u8]) -> Result<Box<dyn PostQuantumType>, Error>; ALGORITHM_COUNT as usize] = [
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_babybear::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_babybearephem::new_bob),
-
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_firesaber::new_bob),
-
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem640aes::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem640shake::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem976aes::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem976shake::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem1344aes::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem1344shake::new_bob),
-
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_kyber512::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_kyber768::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_kyber1024::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_kyber51290s::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_kyber76890s::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_kyber102490s::new_bob),
-
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_ledakemlt12::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_ledakemlt32::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_ledakemlt52::new_bob),
-
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_lightsaber::new_bob),
-
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_mamabear::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_mamabearephem::new_bob),
-
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_mceliece348864::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_mceliece348864f::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_mceliece460896::new_bob),
@@ -366,20 +455,16 @@ pub(crate) mod function_pointers {
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_mceliece6960119f::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_mceliece8192128::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_mceliece8192128f::new_bob),
-
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_newhope512cca::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_newhope512cpa::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_newhope1024cca::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_newhope1024cpa::new_bob),
-
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_ntruhps2048509::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_ntruhps2048677::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_ntruhps4096821::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_ntruhrss701::new_bob),
-
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_papabear::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_papabearephem::new_bob),
-
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_saber::new_bob)
     ];
 }
@@ -388,58 +473,67 @@ pub(crate) mod function_pointers {
 pub(crate) mod post_quantum_structs {
     use pqcrypto::traits::kem::*;
     use super::PostQuantumType;
+    use pqcrypto_traits::Error;
 
-    create_struct!(PostQuantumAlgorithmData_babybear, babybear);
-    create_struct!(PostQuantumAlgorithmData_babybearephem, babybearephem);
+fn get_generic_error(text: &'static str) -> Error {
+    Error::BadLength {
+        name: text,
+        actual: 0,
+        expected: 0,
+    }
+}
 
-    create_struct!(PostQuantumAlgorithmData_firesaber, firesaber);
+create_struct!(PostQuantumAlgorithmData_babybear, babybear);
+create_struct!(PostQuantumAlgorithmData_babybearephem, babybearephem);
 
-    create_struct!(PostQuantumAlgorithmData_frodokem640aes, frodokem640aes);
-    create_struct!(PostQuantumAlgorithmData_frodokem640shake, frodokem640shake);
-    create_struct!(PostQuantumAlgorithmData_frodokem976aes, frodokem976aes);
-    create_struct!(PostQuantumAlgorithmData_frodokem976shake, frodokem976shake);
-    create_struct!(PostQuantumAlgorithmData_frodokem1344aes, frodokem1344aes);
-    create_struct!(PostQuantumAlgorithmData_frodokem1344shake, frodokem1344shake);
+create_struct!(PostQuantumAlgorithmData_firesaber, firesaber);
 
-    create_struct!(PostQuantumAlgorithmData_kyber512, kyber512);
-    create_struct!(PostQuantumAlgorithmData_kyber768, kyber768);
-    create_struct!(PostQuantumAlgorithmData_kyber1024, kyber1024);
-    create_struct!(PostQuantumAlgorithmData_kyber51290s, kyber51290s);
-    create_struct!(PostQuantumAlgorithmData_kyber76890s, kyber76890s);
-    create_struct!(PostQuantumAlgorithmData_kyber102490s, kyber102490s);
+create_struct!(PostQuantumAlgorithmData_frodokem640aes, frodokem640aes);
+create_struct!(PostQuantumAlgorithmData_frodokem640shake, frodokem640shake);
+create_struct!(PostQuantumAlgorithmData_frodokem976aes, frodokem976aes);
+create_struct!(PostQuantumAlgorithmData_frodokem976shake, frodokem976shake);
+create_struct!(PostQuantumAlgorithmData_frodokem1344aes, frodokem1344aes);
+create_struct!(PostQuantumAlgorithmData_frodokem1344shake, frodokem1344shake);
 
-    create_struct!(PostQuantumAlgorithmData_ledakemlt12, ledakemlt12);
-    create_struct!(PostQuantumAlgorithmData_ledakemlt32, ledakemlt32);
-    create_struct!(PostQuantumAlgorithmData_ledakemlt52, ledakemlt52);
+create_struct!(PostQuantumAlgorithmData_kyber512, kyber512);
+create_struct!(PostQuantumAlgorithmData_kyber768, kyber768);
+create_struct!(PostQuantumAlgorithmData_kyber1024, kyber1024);
+create_struct!(PostQuantumAlgorithmData_kyber51290s, kyber51290s);
+create_struct!(PostQuantumAlgorithmData_kyber76890s, kyber76890s);
+create_struct!(PostQuantumAlgorithmData_kyber102490s, kyber102490s);
 
-    create_struct!(PostQuantumAlgorithmData_lightsaber, lightsaber);
+create_struct!(PostQuantumAlgorithmData_ledakemlt12, ledakemlt12);
+create_struct!(PostQuantumAlgorithmData_ledakemlt32, ledakemlt32);
+create_struct!(PostQuantumAlgorithmData_ledakemlt52, ledakemlt52);
 
-    create_struct!(PostQuantumAlgorithmData_mamabear, mamabear);
-    create_struct!(PostQuantumAlgorithmData_mamabearephem, mamabearephem);
+create_struct!(PostQuantumAlgorithmData_lightsaber, lightsaber);
 
-    create_struct!(PostQuantumAlgorithmData_mceliece348864, mceliece348864);
-    create_struct!(PostQuantumAlgorithmData_mceliece348864f, mceliece348864f);
-    create_struct!(PostQuantumAlgorithmData_mceliece460896, mceliece460896);
-    create_struct!(PostQuantumAlgorithmData_mceliece460896f, mceliece460896f);
-    create_struct!(PostQuantumAlgorithmData_mceliece6688128, mceliece6688128);
-    create_struct!(PostQuantumAlgorithmData_mceliece6688128f, mceliece6688128f);
-    create_struct!(PostQuantumAlgorithmData_mceliece6960119, mceliece6960119);
-    create_struct!(PostQuantumAlgorithmData_mceliece6960119f, mceliece6960119f);
-    create_struct!(PostQuantumAlgorithmData_mceliece8192128, mceliece8192128);
-    create_struct!(PostQuantumAlgorithmData_mceliece8192128f, mceliece8192128f);
+create_struct!(PostQuantumAlgorithmData_mamabear, mamabear);
+create_struct!(PostQuantumAlgorithmData_mamabearephem, mamabearephem);
 
-    create_struct!(PostQuantumAlgorithmData_newhope512cca, newhope512cca);
-    create_struct!(PostQuantumAlgorithmData_newhope512cpa, newhope512cpa);
-    create_struct!(PostQuantumAlgorithmData_newhope1024cca, newhope1024cca);
-    create_struct!(PostQuantumAlgorithmData_newhope1024cpa, newhope1024cpa);
+create_struct!(PostQuantumAlgorithmData_mceliece348864, mceliece348864);
+create_struct!(PostQuantumAlgorithmData_mceliece348864f, mceliece348864f);
+create_struct!(PostQuantumAlgorithmData_mceliece460896, mceliece460896);
+create_struct!(PostQuantumAlgorithmData_mceliece460896f, mceliece460896f);
+create_struct!(PostQuantumAlgorithmData_mceliece6688128, mceliece6688128);
+create_struct!(PostQuantumAlgorithmData_mceliece6688128f, mceliece6688128f);
+create_struct!(PostQuantumAlgorithmData_mceliece6960119, mceliece6960119);
+create_struct!(PostQuantumAlgorithmData_mceliece6960119f, mceliece6960119f);
+create_struct!(PostQuantumAlgorithmData_mceliece8192128, mceliece8192128);
+create_struct!(PostQuantumAlgorithmData_mceliece8192128f, mceliece8192128f);
 
-    create_struct!(PostQuantumAlgorithmData_ntruhps2048509, ntruhps2048509);
-    create_struct!(PostQuantumAlgorithmData_ntruhps2048677, ntruhps2048677);
-    create_struct!(PostQuantumAlgorithmData_ntruhps4096821, ntruhps4096821);
+create_struct!(PostQuantumAlgorithmData_newhope512cca, newhope512cca);
+create_struct!(PostQuantumAlgorithmData_newhope512cpa, newhope512cpa);
+create_struct!(PostQuantumAlgorithmData_newhope1024cca, newhope1024cca);
+create_struct!(PostQuantumAlgorithmData_newhope1024cpa, newhope1024cpa);
 
-    create_struct!(PostQuantumAlgorithmData_ntruhrss701, ntruhrss701);
+create_struct!(PostQuantumAlgorithmData_ntruhps2048509, ntruhps2048509);
+create_struct!(PostQuantumAlgorithmData_ntruhps2048677, ntruhps2048677);
+create_struct!(PostQuantumAlgorithmData_ntruhps4096821, ntruhps4096821);
 
-    create_struct!(PostQuantumAlgorithmData_papabear, papabear);
-    create_struct!(PostQuantumAlgorithmData_papabearephem, papabearephem);
-    create_struct!(PostQuantumAlgorithmData_saber, saber);
+create_struct!(PostQuantumAlgorithmData_ntruhrss701, ntruhrss701);
+
+create_struct!(PostQuantumAlgorithmData_papabear, papabear);
+create_struct!(PostQuantumAlgorithmData_papabearephem, papabearephem);
+create_struct!(PostQuantumAlgorithmData_saber, saber);
 }

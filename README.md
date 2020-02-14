@@ -18,3 +18,5 @@ alice_container.alice_on_receive_ciphertext(bob_ciphertext);
 
 assert_eq!(alice_container.get_shared_secret(), bob_container.get_shared_secret());
 ```
+
+Furthermore, supports serialization/deserialization

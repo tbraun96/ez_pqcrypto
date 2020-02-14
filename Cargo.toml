@@ -19,6 +19,10 @@ exclude = [
 [dependencies]
 bytes = "0.5.4"
 pqcrypto = "0.9.0"
+pqcrypto-traits = "0.3.3"
+serde = "1.0.104"
+bincode2 = "2.0.1"
+rand = "0.7.3"
 
 [dev-dependencies]
 criterion = "0.3.1"
