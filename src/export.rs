@@ -1,8 +1,7 @@
-use serde::{Serialize, Deserialize};
 use crate::PostQuantumContainer;
 
 /// The default type to store data from a [PostQuantumContainer]
-#[derive(Serialize, Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PostQuantumExport {
     pub(super) algorithm: u8,
     pub(super) public_key: Vec<u8>,
