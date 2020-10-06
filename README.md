@@ -1,5 +1,5 @@
 # ez_pqcrypto
-A cryptographic container that handles post-quantum key exchange, encryption/decryption, and in-place "protection" of plaintext packets (less calls to allocator). Effectively, using the protection functions ensures that
+A cryptographic container built in rust that handles post-quantum key exchange, encryption/decryption, and in-place "protection" of plaintext packets (less calls to allocator). Effectively, using the protection functions ensures that
 packets sent over the wire maintain confidentiality, authenticity, and integrity. Furthermore, this crate provides protection against replay attacks by appending a u64 to the end of each payload and is thereafter included as part of the payload ciphertext.
 
 There are two classes of features in this crate. The first relates to the encryption/decryption algorithm used:
