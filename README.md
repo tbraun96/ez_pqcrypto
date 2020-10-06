@@ -23,11 +23,11 @@ This crate uses pqcrypto/pqclean for the underlying cryptographic primitives
 Example of post-quantum key exchange:
 
 ```rust
+let algorithm_byte_value = algorithm_dictionary::FIRESABER;
 // Alice wants to share data with Bob. She first creates a PostQuantumContainer
-let mut alice_container = PostQuantumContainer::new_alice(algorithm_dictionary::BABYBEAR);
+let mut alice_container = PostQuantumContainer::new_alice(algorithm_byte_value);
 // Then, alice sender her public key to Bob. She must also send the byte value of algorithm_dictionary::BABYBEAR to him (the only one currently used)
 let alice_public_key = alice_container.get_public_key();
-let algorithm_byte_value = algorithm_dictionary::BABYBEAR;
 //
 // Then, Bob gets the public key. To process it, he must create a PostQuantumContainer for himself
 let bob_container = PostQuantumContainer::new_bob(algorithm_byte_value, alice_public_key);
