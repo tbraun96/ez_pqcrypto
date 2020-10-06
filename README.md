@@ -4,19 +4,21 @@ packets sent over the wire preserve confidentiality, authenticity, and integrity
 
 There are two classes of features in this crate. The first relates to the encryption/decryption algorithm used:
 
-[*] aes
-[*] chacha20
+* aes
+* chacha20
 
-By default, aes is selected. The aes feature will imply that AES-GCM-SIV (protection against nonce-misuse) is compiled. The use of chacha20 will imply XChaCha20-Poly1305 is used. Select one
+By default, ``aes`` is selected. The aes feature will imply that AES-GCM-SIV (protection against nonce-misuse) is compiled. The use of ``chacha20`` will imply XChaCha20-Poly1305 is used. Select one
 
 The second class of features relates to the anti-replay attack container:
 
-[*] ordered
-[*] unordered
+* ordered
+* unordered
 
-By default, the ordered feature is used. When this is used, a atomically-backed compare and swap (CAS) operation is used to keep track of packets as they flow outbound and inbound. If
-you are using TCP, use ordered. If, however, you are using an unordered (yet reliable) protocol, then use unordered. When using unordered, a fixed-capacity circular ring buffer is used
+By default, the ``ordered`` feature is used. When this is used, a atomically-backed compare and swap (CAS) operation is used to keep track of packets as they flow outbound and inbound. If
+you are using TCP, use ordered. If, however, you are using an unordered (yet reliable) protocol, then use ``unordered``. When using ``unordered``, a fixed-capacity circular ring buffer is used
 to keep track of a neighborhood of packets to ensure packets are not necessarily expected in serial order.
+
+This crate uses pqcrypto/pqclean for the underlying cryptographic primitives
 
 Example of post-quantum key exchange:
 
