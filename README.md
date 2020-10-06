@@ -18,7 +18,7 @@ By default, the ``ordered`` feature is used. When this is used, a atomically-bac
 you are using TCP, use ordered. If, however, you are using an unordered (yet reliable) protocol, then use ``unordered``. When using ``unordered``, a fixed-capacity circular ring buffer is used
 to keep track of a neighborhood of packets to ensure packets are not necessarily expected in serial order.
 
-This crate uses pqcrypto/pqclean for the underlying cryptographic primitives
+This crate uses pqcrypto/pqclean for the underlying cryptographic primitives. Currently, only FIRESABER is selected from pqcrypto.
 
 Example of post-quantum key exchange:
 
@@ -26,7 +26,7 @@ Example of post-quantum key exchange:
 let algorithm_byte_value = algorithm_dictionary::FIRESABER;
 // Alice wants to share data with Bob. She first creates a PostQuantumContainer
 let mut alice_container = PostQuantumContainer::new_alice(algorithm_byte_value);
-// Then, alice sender her public key to Bob. She must also send the byte value of algorithm_dictionary::BABYBEAR to him (the only one currently used)
+// Then, alice sender her public key to Bob. She must also send the byte value of algorithm_dictionary::FIRESABER to him (the only one currently used)
 let alice_public_key = alice_container.get_public_key();
 //
 // Then, Bob gets the public key. To process it, he must create a PostQuantumContainer for himself
