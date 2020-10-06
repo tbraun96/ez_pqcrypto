@@ -18,7 +18,7 @@ By default, the ``ordered`` feature is used. When this is used, a atomically-bac
 you are using TCP, use ordered. If, however, you are using an unordered (yet reliable) protocol, then use ``unordered``. When using ``unordered``, a fixed-capacity circular ring buffer is used
 to keep track of a neighborhood of packets to ensure packets are not necessarily expected in serial order.
 
-This crate uses pqcrypto/pqclean for the underlying cryptographic primitives. Currently, only FIRESABER is selected from pqcrypto.
+This crate uses pqcrypto/pqclean for the underlying cryptographic primitives. Currently, only FIRESABER is selected from pqcrypto. Everything in the ``./pqcrypto`` folder is not my work.
 
 Example of post-quantum key exchange:
 
