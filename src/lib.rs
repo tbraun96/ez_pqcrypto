@@ -1,29 +1,51 @@
 #![allow(non_camel_case_types)]
 
-use bytes::{BytesMut, BufMut};
 use crate::algorithm_dictionary::*;
 use rand::Rng;
-use pqcrypto_traits::Error;
 use crate::export::PostQuantumExport;
-use bincode2::ErrorKind;
+use pqcrypto::traits::Error;
 use std::convert::TryFrom;
+#[cfg(feature = "chacha20")]
+use chacha20poly1305::{XChaCha20Poly1305 as AeadKey, aead::{NewAead, Aead, AeadInPlace, generic_array::GenericArray}};
+#[cfg(not(feature = "chacha20"))]
+use aes_gcm_siv::{Aes256GcmSiv as AeadKey, aead::{NewAead, Aead, AeadInPlace, generic_array::GenericArray}};
+use crate::ez_error::EzError;
+use nanoserde::{SerBin, DeBin};
+use crate::bytes_in_place::InPlaceBytesMut;
+use bytes::{BytesMut, BufMut};
+use crate::replay_attack_container::ordered::AntiReplayAttackContainerOrdered;
 
 pub mod prelude {
+    pub use pqcrypto::traits::Error;
     pub use crate::{PQNode, PostQuantumContainer, PostQuantumType, algorithm_dictionary};
 }
 
+#[cfg(feature = "chacha20")]
+pub const NONCE_LENGTH_BYTES: usize = 24;
+
+#[cfg(not(feature = "chacha20"))]
+pub const NONCE_LENGTH_BYTES: usize = 12;
+
+pub mod bytes_in_place;
 /// For handling serialization/deserialization
 pub mod export;
 
+/// For organizing error types
+pub mod ez_error;
+
+pub mod replay_attack_container;
+
 /// Contains the public keys for Alice and Bob
 pub struct PostQuantumContainer {
-    algorithm: u8,
-    data: Box<dyn PostQuantumType>,
-    node: PQNode,
+    pub(crate) algorithm: u8,
+    pub(crate) data: Box<dyn PostQuantumType>,
+    pub(crate) anti_replay_attack: AntiReplayAttackContainerOrdered,
+    pub(crate) aes_gcm_key: Option<AeadKey>,
+    pub(crate) node: PQNode
 }
 
 /// Used to denote the local node's instance type
-#[derive(PartialEq, Copy, Clone)]
+#[derive(PartialEq, Copy, Clone, Debug)]
 pub enum PQNode {
     /// The first node in the exchange. Alice generates a key, gets a public key (pk)
     /// and a secret key (sk). Alice sends pk to Bob
@@ -35,6 +57,7 @@ pub enum PQNode {
     Bob,
 }
 
+
 impl PostQuantumContainer {
     /// Creates a new [PostQuantumContainer] for Alice. This will panic if the algorithm is
     /// invalid
@@ -44,19 +67,41 @@ impl PostQuantumContainer {
         let algorithm = algorithm.unwrap_or_else(|| {
             rand::thread_rng().gen_range(0, ALGORITHM_COUNT)
         });
-        Self { algorithm, data: Self::get_new_alice(algorithm), node: PQNode::Alice }
+
+        let data = Self::get_new_alice(algorithm);
+        let aes_gcm_key = None;
+        Self { algorithm, data, aes_gcm_key, anti_replay_attack: AntiReplayAttackContainerOrdered::default(), node: PQNode::Alice }
     }
 
     /// Creates a new [PostQuantumContainer] for Bob. This will panic if the algorithm is
     /// invalid
     pub fn new_bob(algorithm: u8, public_key: &[u8]) -> Result<Self, Error> {
-        Ok(Self { algorithm, data: Self::get_new_bob(algorithm, public_key)?, node: PQNode::Bob })
+        let data = Self::get_new_bob(algorithm, public_key)?;
+        // We must call the below to refresh the internal state to allow get_shared_secret to function
+        let ss = data.get_shared_secret().unwrap();
+        let key = GenericArray::<u8, _>::from_exact_iter(ss.into_iter().cloned()).ok_or(Error::BadLength {
+            name: "",
+            actual: 0,
+            expected: 0
+        })?;
+
+        let aes_gcm_key = Some(AeadKey::new(&key));
+
+        Ok(Self { algorithm, aes_gcm_key, data, anti_replay_attack: AntiReplayAttackContainerOrdered::default(), node: PQNode::Bob })
+    }
+
+    /// This should always be called after deserialization
+    fn load_aes_gcm_key(&mut self) {
+        self.aes_gcm_key = Some(AeadKey::new(&GenericArray::clone_from_slice(self.get_shared_secret().unwrap())))
     }
 
     /// Internally creates shared key after bob sends a response back to Alice
     pub fn alice_on_receive_ciphertext(&mut self, ciphertext: &[u8]) -> Result<(), Error> {
-        debug_assert!(self.node == PQNode::Alice);
-        self.data.alice_on_receive_ciphertext(ciphertext)
+        //debug_assert_eq!(self.node, PQNode::Alice);
+        self.data.alice_on_receive_ciphertext(ciphertext)?;
+        let ss = self.data.get_shared_secret().unwrap();
+        self.aes_gcm_key = Some(AeadKey::new(&GenericArray::clone_from_slice(ss)));
+        Ok(())
     }
     /// Gets the public key
     pub fn get_public_key(&self) -> &[u8] {
@@ -76,16 +121,17 @@ impl PostQuantumContainer {
     }
 
     /// Serializes the entire package to a vector
-    pub fn serialize_to_vector(&self) -> Result<Vec<u8>, Box<ErrorKind>> {
+    pub fn serialize_to_vector(&self) -> Result<Vec<u8>, Error> {
         let export = PostQuantumExport::from(self);
-        bincode2::serialize(&export)
+        Ok(export.serialize_bin())
     }
 
     /// Attempts to deserialize the input bytesm presumed to be of type [PostQuantumExport],
     /// into a [PostQuantumContainer]
-    pub fn deserialize_from_bytes<B: AsRef<[u8]>>(bytes: B) -> Result<Self, Box<ErrorKind>> {
-        let export = bincode2::deserialize::<PostQuantumExport>(bytes.as_ref())?;
-        PostQuantumContainer::try_from(export)
+    pub fn deserialize_from_bytes<B: AsRef<[u8]>>(bytes: B) -> Result<Self, EzError> {
+        //let export = bincode2::deserialize::<PostQuantumExport>(bytes.as_ref())?;
+        let export = PostQuantumExport::deserialize_bin(bytes.as_ref()).map_err(|_err| EzError::Generic("Deserialization failure"))?;
+        PostQuantumContainer::try_from(export).map_err(|_err| EzError::Generic("Deserialization failure"))
     }
 
     /// Returns either Alice or Bob
@@ -98,37 +144,157 @@ impl PostQuantumContainer {
         self.algorithm
     }
 
-    fn get_new_alice(algorithm: u8) -> Box<dyn PostQuantumType> {
-        assert!(algorithm < ALGORITHM_COUNT);
-        crate::function_pointers::ALICE_FP[algorithm as usize]()
+    /// Encrypts the data. This will return an error if the internal shared secret is not set
+    pub fn encrypt<T: AsRef<[u8]>, R: AsRef<[u8]>>(&self, input: T, nonce: R) -> Result<Vec<u8>, EzError> where Self: Sized {
+        let input = input.as_ref();
+        let nonce = nonce.as_ref();
+        let nonce = GenericArray::from_slice(nonce);
+
+        // if the shared secret is loaded, the AES GCM abstraction should too.
+
+        if let Some(aes_gcm_key) = self.aes_gcm_key.as_ref() {
+            match aes_gcm_key.encrypt(nonce, input) {
+                Err(_) => {
+                    Err(EzError::AesGcmEncryptionFailure)
+                },
+
+                Ok(vec) => {
+                    Ok(vec)
+                }
+            }
+        } else {
+            Err(EzError::SharedSecretNotLoaded)
+        }
     }
 
+    pub fn protect_packet_in_place<R: AsRef<[u8]>>(&self, header_len: usize, full_packet: &mut BytesMut, nonce: R) -> Result<(), EzError> {
+        let nonce = nonce.as_ref();
+        let nonce = GenericArray::from_slice(nonce);
+        let mut payload = full_packet.split_off(header_len);
+        let header = full_packet;
+
+        // next, push the ARA-generated PID
+        payload.put_u64(self.anti_replay_attack.get_next_pid());
+        let payload_len = payload.len();
+
+        let mut in_place_payload = InPlaceBytesMut::new(&mut payload, 0..payload_len).ok_or_else(|| EzError::Generic("Bad window range"))?;
+        if let Some(aes_gcm_key) = self.aes_gcm_key.as_ref() {
+            aes_gcm_key.encrypt_in_place(nonce, &header[0..header_len], &mut in_place_payload).map_err(|_| EzError::AesGcmEncryptionFailure)?;
+            header.unsplit(payload);
+            Ok(())
+        } else {
+            Err(EzError::SharedSecretNotLoaded)
+        }
+    }
+
+    /// Validates the AAD (header) and produces the plaintext given the input of ciphertext
+    pub fn validate_packet_in_place<H: AsRef<[u8]>, R: AsRef<[u8]>>(&self, header: H, mut payload: &mut BytesMut, nonce: R) -> Result<(), EzError> {
+        let nonce = nonce.as_ref();
+        let nonce = GenericArray::from_slice(nonce);
+        let header = header.as_ref();
+        let payload_len = payload.len();
+
+        let mut in_place_payload = InPlaceBytesMut::new(&mut payload, 0..payload_len).ok_or_else(|| EzError::Generic("Bad window range"))?;
+        if let Some(aes_gcm_key) = self.aes_gcm_key.as_ref() {
+            aes_gcm_key.decrypt_in_place(nonce, header, &mut in_place_payload).map_err(|_| EzError::AesGcmDecryptionFailure)
+                .and_then(|_| {
+                    // get the last 8 bytes of the payload
+                    let end_idx = payload.len();
+                    let start_idx = end_idx.saturating_sub(8);
+                    if end_idx - start_idx == 8 {
+                        let mut array: [u8; 8] = Default::default();
+                        array.copy_from_slice(&payload[start_idx..end_idx]);
+
+                        if self.anti_replay_attack.on_pid_received(u64::from_be_bytes(array)) {
+                            // remove the PID from the payload
+                            payload.truncate(start_idx);
+                            return Ok(())
+                        }
+                    }
+
+                    Err(EzError::Generic("Anti-replay-attack: invalid"))
+                })
+        } else {
+            Err(EzError::SharedSecretNotLoaded)
+        }
+    }
+
+    /// Encrypts the data. This will return an error if the internal shared secret is not set
+    pub fn decrypt<T: AsRef<[u8]>, R: AsRef<[u8]>>(&self, input: T, nonce: R) -> Result<Vec<u8>, EzError> where Self: Sized {
+        let input = input.as_ref();
+        let nonce = nonce.as_ref();
+
+        let nonce = GenericArray::from_slice(nonce);
+        // if the shared secret is loaded, the AES GCM abstraction should too.
+
+        if let Some(aes_gcm_key) = self.aes_gcm_key.as_ref() {
+            match aes_gcm_key.decrypt(nonce, input) {
+                Err(_) => {
+                    Err(EzError::AesGcmDecryptionFailure)
+                },
+
+                Ok(vec) => {
+                    Ok(vec)
+                }
+            }
+        } else {
+            Err(EzError::SharedSecretNotLoaded)
+        }
+    }
+
+    /// This, for now, only gets FIRESABER
+    fn get_new_alice(algorithm: u8) -> Box<dyn PostQuantumType> {
+        assert!(algorithm < ALGORITHM_COUNT);
+        crate::function_pointers::ALICE_FP[0]()
+    }
+
+    /// This, for now, only gets FIRESABER
     fn get_new_bob(algorithm: u8, public_key: &[u8]) -> Result<Box<dyn PostQuantumType>, Error> {
         assert!(algorithm < ALGORITHM_COUNT);
-        crate::function_pointers::BOB_FP[algorithm as usize](public_key)
+        crate::function_pointers::BOB_FP[0](public_key)
+    }
+}
+
+impl Clone for PostQuantumContainer {
+    fn clone(&self) -> Self {
+        let ser = self.serialize_to_vector().unwrap();
+        PostQuantumContainer::deserialize_from_bytes(ser).unwrap()
     }
 }
 
 impl TryFrom<PostQuantumExport> for PostQuantumContainer {
-    type Error = Box<ErrorKind>;
+    type Error = Error;
 
     fn try_from(export: PostQuantumExport) -> Result<Self, Self::Error> {
         // First, create the type, pretending this node is Bob since we already
         // have the public key
-        let mut container = PostQuantumContainer::new_bob(export.algorithm, export.public_key.as_slice())
-            .map_err(|err| Box::new(ErrorKind::Custom(err.to_string())))?;
+        let algorithm = export.algorithm;
+        let node = if export.node == 0 {
+            PQNode::Alice
+        } else {
+            PQNode::Bob
+        };
+
+        let mut container = PostQuantumContainer::new_bob(algorithm, export.public_key.as_slice())?;
+        container.node = node;
+        container.data.set_public_key(export.public_key.as_slice()).unwrap();
+
         // Now, begin setting the values
         if let Some(secret_key) = export.secret_key {
-            container.data.set_secret_key(secret_key.as_slice()).map_err(|err| Box::new(ErrorKind::Custom(err.to_string())))?;
+            container.data.set_secret_key(secret_key.as_slice())?;
         }
 
         if let Some(ciphertext) = export.ciphertext {
-            container.data.set_ciphertext(ciphertext.as_slice()).map_err(|err| Box::new(ErrorKind::Custom(err.to_string())))?;
+            container.data.set_ciphertext(ciphertext.as_slice())?;
         }
 
         if let Some(shared_secret) = export.shared_secret {
-            container.data.set_shared_secret(shared_secret.as_slice()).map_err(|err| Box::new(ErrorKind::Custom(err.to_string())))?;
+            let shared_secret_slice = shared_secret.as_slice();
+            container.data.set_shared_secret(shared_secret_slice)?;
+
         }
+
+        container.load_aes_gcm_key();
 
         Ok(container)
     }
@@ -195,7 +361,7 @@ pub mod algorithm_dictionary {
 }
 
 /// Used to get different algorithm types dynamically
-pub trait PostQuantumType {
+pub trait PostQuantumType: Send + Sync {
     /// Creates a new self for the initiating node
     fn new_alice() -> Self where Self: Sized;
     /// Creates a new self for the receiving node
@@ -216,35 +382,14 @@ pub trait PostQuantumType {
     fn set_ciphertext(&mut self, ciphertext: &[u8]) -> Result<(), Error>;
     /// Sets the shared key
     fn set_shared_secret(&mut self, shared_key: &[u8]) -> Result<(), Error>;
-    /// Encrypts the data. Since this is meant for small data, no heavy optimization is used
-    fn encrypt_data<T: AsRef<[u8]>>(&self, input: T, output: &mut BytesMut) -> Result<(), Error> where Self: Sized {
-        let input = input.as_ref();
-        let ss = self.get_shared_secret()?;
-        let ss_len = ss.len();
-
-        for (idx, byte) in input.iter().enumerate() {
-            output.put_u8(*byte ^ ss[idx % ss_len])
-        }
-
-        Ok(())
-    }
-    /// Decrypts the data
-    fn decrypt_data<T: AsRef<[u8]>>(&self, input: T, output: &mut BytesMut) -> Result<(), Error> where Self: Sized {
-        let input = input.as_ref();
-        let ss = self.get_shared_secret()?;
-        let ss_len = ss.len();
-
-        for (idx, byte) in input.iter().enumerate() {
-            output.put_u8(*byte ^ ss[idx % ss_len])
-        }
-
-        Ok(())
-    }
+    /// Sets the public key
+    fn set_public_key(&mut self, public_key: &[u8]) -> Result<(), Error>;
 }
 
 macro_rules! create_struct {
     ($base:ident, $name:ident) => {
         /// Auto generated
+        #[derive(Clone)]
         pub(crate) struct $base {
             /// The public key. Both Alice and Bob get this
             public_key: pqcrypto::kem::$name::PublicKey,
@@ -256,12 +401,17 @@ macro_rules! create_struct {
             shared_secret: Option<pqcrypto::kem::$name::SharedSecret>
         }
 
+        //unsafe impl Send for $base {}
+        //unsafe impl Sync for $base {}
+
         impl PostQuantumType for $base {
+
             fn new_alice() -> Self {
                 let (public_key, secret_key) = pqcrypto::kem::$name::keypair();
                 let ciphertext = None;
                 let shared_secret = None;
                 let secret_key = Some(secret_key);
+
                 Self { public_key, secret_key, ciphertext, shared_secret }
             }
 
@@ -271,14 +421,15 @@ macro_rules! create_struct {
                 let secret_key = None;
                 let shared_secret = Some(shared_secret);
                 let ciphertext = Some(ciphertext);
+
                 Ok(Self { public_key, secret_key, ciphertext, shared_secret })
             }
 
             fn alice_on_receive_ciphertext(&mut self, ciphertext: &[u8]) -> Result<(), Error> {
                 // These functions should only be called once upon response back from Bob
-                debug_assert!(self.shared_secret.is_none());
-                debug_assert!(self.ciphertext.is_none());
-                debug_assert!(self.secret_key.is_some());
+                assert!(self.shared_secret.is_none());
+                assert!(self.ciphertext.is_none());
+                assert!(self.secret_key.is_some());
 
                 let ciphertext = pqcrypto::kem::$name::Ciphertext::from_bytes(ciphertext)?;
 
@@ -324,6 +475,13 @@ macro_rules! create_struct {
                 }
             }
 
+            fn set_public_key(&mut self, public_key: &[u8]) -> Result<(), Error> {
+                let public_key = pqcrypto::kem::$name::PublicKey::from_bytes(public_key)?;
+                self.public_key = public_key;
+
+                Ok(())
+            }
+
             /// Sets the secret key
             fn set_secret_key(&mut self, secret_key: &[u8]) -> Result<(), Error> {
                 let secret_key = pqcrypto::kem::$name::SecretKey::from_bytes(secret_key)?;
@@ -353,8 +511,8 @@ macro_rules! create_struct {
 
 pub(crate) mod function_pointers {
     use crate::PostQuantumType;
-    use crate::algorithm_dictionary::ALGORITHM_COUNT;
-    use pqcrypto_traits::Error;
+    //use crate::algorithm_dictionary::ALGORITHM_COUNT;
+    use pqcrypto::traits::Error;
 
     macro_rules! box_alice {
     ($constructor:expr) => {{
@@ -378,10 +536,11 @@ pub(crate) mod function_pointers {
     }};
 }
 
-    pub(crate) static ALICE_FP: [fn() -> Box<dyn PostQuantumType>; ALGORITHM_COUNT as usize] = [
-        box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_babybear::new_alice),
-        box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_babybearephem::new_alice),
+    pub(crate) static ALICE_FP: [fn() -> Box<dyn PostQuantumType>; 1] = [
+        //box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_babybear::new_alice),
+        //box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_babybearephem::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_firesaber::new_alice),
+        /*
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem640aes::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem640shake::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem976aes::new_alice),
@@ -420,13 +579,15 @@ pub(crate) mod function_pointers {
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_ntruhrss701::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_papabear::new_alice),
         box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_papabearephem::new_alice),
-        box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_saber::new_alice)
+        box_alice!(crate::post_quantum_structs::PostQuantumAlgorithmData_saber::new_alice)*/
     ];
 
-    pub(crate) static BOB_FP: [fn(&[u8]) -> Result<Box<dyn PostQuantumType>, Error>; ALGORITHM_COUNT as usize] = [
+    pub(crate) static BOB_FP: [fn(&[u8]) -> Result<Box<dyn PostQuantumType>, Error>; 1] = [
+        /*
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_babybear::new_bob),
-        box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_babybearephem::new_bob),
+        box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_babybearephem::new_bob),*/
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_firesaber::new_bob),
+        /*
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem640aes::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem640shake::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_frodokem976aes::new_bob),
@@ -465,7 +626,7 @@ pub(crate) mod function_pointers {
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_ntruhrss701::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_papabear::new_bob),
         box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_papabearephem::new_bob),
-        box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_saber::new_bob)
+        box_bob!(crate::post_quantum_structs::PostQuantumAlgorithmData_saber::new_bob)*/
     ];
 }
 
@@ -473,7 +634,7 @@ pub(crate) mod function_pointers {
 pub(crate) mod post_quantum_structs {
     use pqcrypto::traits::kem::*;
     use super::PostQuantumType;
-    use pqcrypto_traits::Error;
+    use pqcrypto::traits::Error;
 
 fn get_generic_error(text: &'static str) -> Error {
     Error::BadLength {
@@ -482,12 +643,12 @@ fn get_generic_error(text: &'static str) -> Error {
         expected: 0,
     }
 }
-
+    /*
 create_struct!(PostQuantumAlgorithmData_babybear, babybear);
 create_struct!(PostQuantumAlgorithmData_babybearephem, babybearephem);
-
+*/
 create_struct!(PostQuantumAlgorithmData_firesaber, firesaber);
-
+/*
 create_struct!(PostQuantumAlgorithmData_frodokem640aes, frodokem640aes);
 create_struct!(PostQuantumAlgorithmData_frodokem640shake, frodokem640shake);
 create_struct!(PostQuantumAlgorithmData_frodokem976aes, frodokem976aes);
@@ -535,5 +696,5 @@ create_struct!(PostQuantumAlgorithmData_ntruhrss701, ntruhrss701);
 
 create_struct!(PostQuantumAlgorithmData_papabear, papabear);
 create_struct!(PostQuantumAlgorithmData_papabearephem, papabearephem);
-create_struct!(PostQuantumAlgorithmData_saber, saber);
+create_struct!(PostQuantumAlgorithmData_saber, saber);*/
 }
